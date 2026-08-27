@@ -5,7 +5,8 @@
     "plans with the same vendor needs no code: register it twice under different",
     "names with different api_key_env and list both in a route's rotate pool —",
     "the spent-window cooldown keys on provider/model, so the plans park apart.",
-    "The KEY ITSELF never appears here: only the name of the file to read it from."
+    "The KEY ITSELF never appears here: only the name of the file to read it from.",
+    "Add your own providers freely: any OpenAI-compatible base_url works, including a local vLLM/Ollama box (give no-auth endpoints a placeholder key file)."
   ],
   "ark": {
     "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
@@ -18,9 +19,5 @@
   "deepseek": {
     "base_url": "https://api.deepseek.com/v1",
     "api_key_env": "DEEPSEEK_API_KEY"
-  },
-  "local": {
-    "base_url": "http://127.0.0.1:8000/v1",
-    "api_key_env": "LOCAL_API_KEY"
   }
 }

@@ -4,15 +4,14 @@
 front of every plan you hold — so the 5-hour and weekly windows you already pay
 for all get used, instead of one plan burning out while the others expire idle.
 
-Born for DeepSeek refugees: prices moved, everyone now holds two or three
-subscriptions plus a pay-as-you-go key, and every client speaks to exactly one
-of them at a time.
+Born for DeepSeek refugees: instead of hunting for one plan with enough
+capacity, find several whose capacity **adds up** — and let them add up.
 
 ```
-your client  ──►  Robin  ──►  ark/deepseek-v4-flash     (plan A: $12 / 5h)
-(dsh, opencode,        │      qwen/qwen3.8-flash        (plan B: own window)
- Claude Code router,   │      opencodego/deepseek-v4-flash (plan C: $60/mo)
- anything OpenAI-      └────► deepseek/deepseek-v4-flash  (pay-as-you-go, last)
+your client  ──►  Robin  ──►  ark/deepseek-v4-flash        (plan A: own window)
+(dsh, opencode,        │      opencodego/deepseek-v4-flash (plan B: own window)
+ Claude Code router,   │      …add as many as you hold
+ anything OpenAI-      └────► deepseek/deepseek-v4-flash    (pay-as-you-go, last)
  compatible)
 ```
 
@@ -71,9 +70,12 @@ point a client at Robin with no migration:
 }
 ```
 
-Keys are read from files (`~/.aitelier-secrets/<NAME>`, or
-`$ROBIN_SECRETS_DIR`), never from the config — so a config is safe to share and
-a subprocess that inherits the environment does not receive your keys.
+Keys are read from files (`~/.robin-secrets/<NAME>`, or `$ROBIN_SECRETS_DIR`),
+never from the config and never from the environment — so a config is safe to
+share, and a subprocess that inherits the environment does not receive your
+keys. See `.env.example`. A key name with **no file** means "I do not hold this
+plan": Robin skips that endpoint rather than burning a call that cannot
+succeed.
 
 ## Licence
 

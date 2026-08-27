@@ -16,12 +16,21 @@
     "Providers named here must exist in llm_providers.json."
   ],
   "flash": {
-    "rotate": ["ark/deepseek-v4-flash", "opencodego/deepseek-v4-flash"],
-    "fallback": ["deepseek/deepseek-v4-flash"]
+    "rotate": [
+      "ark/deepseek-v4-flash",
+      "opencodego/deepseek-v4-flash"
+    ],
+    "fallback": [
+      "deepseek/deepseek-v4-flash"
+    ]
   },
   "pro": {
-    "rotate": ["ark/deepseek-v4-pro", "opencodego/deepseek-v4-pro"],
-    "fallback": ["deepseek/deepseek-v4-pro"]
-  },
-  "local": ["local/qwen3.8-27b"]
+    "rotate": [
+      "ark/deepseek-v4-pro",
+      "opencodego/deepseek-v4-pro"
+    ],
+    "fallback": [
+      "deepseek/deepseek-v4-pro"
+    ]
+  }
 }
