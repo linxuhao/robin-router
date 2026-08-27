@@ -70,12 +70,19 @@ bought.
 **OpenAI protocol only, in and out.** Robin speaks `/v1/chat/completions` and
 forwards to `/v1/chat/completions`. It does not accept Anthropic-format
 (`/v1/messages`) requests, and it cannot route to an endpoint that only serves
-that shape — which is a real gap inside plans people hold: OpenCode Go, for
-one, serves DeepSeek/GLM/Kimi over the OpenAI shape but Qwen-Max and MiniMax
-over `/v1/messages`. Adding it is additive (a provider gains an `api:` field),
-not a rewrite; it is on the list if people want it. For pooling **Claude**
-subscriptions specifically, `claude-relay-service` and `ccflare` already do
-that job well.
+that shape.
+
+In practice that is a per-**reseller** limit, not a per-model one: OpenCode Go,
+for instance, serves DeepSeek/GLM/Kimi over the OpenAI shape but puts Qwen-Max
+and MiniMax behind `/v1/messages` — while the same models are OpenAI-compatible
+straight from the vendor (Alibaba's DashScope `compatible-mode/v1`), which is
+just another provider entry here. So the gap is "that plan's copy of that
+model", not the model. Adding the Anthropic shape is additive (a provider
+gains an `api:` field) rather than a rewrite; it is on the list if people
+want it.
+
+For pooling **Claude** subscriptions specifically, `claude-relay-service` and
+`ccflare` already do that job well.
 
 Nothing here is DeepSeek-specific — any OpenAI-compatible base URL works; the
 shipped examples just happen to be what the author holds.
