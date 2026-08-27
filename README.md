@@ -1,13 +1,11 @@
 # Robin
 
-*v0.1 — early, and honest about it: see [What it is not](#what-it-is-not).*
-
 **Round-robin your LLM subscriptions.** One local OpenAI-compatible endpoint in
 front of every plan you hold — so the 5-hour and weekly windows you already pay
 for all get used, instead of one plan burning out while the others expire idle.
 
-Born for DeepSeek refugees: instead of hunting for one plan with enough
-capacity, find several whose capacity **adds up** — and let them add up.
+Instead of hunting for one plan with enough capacity, hold several whose
+capacity **adds up** — and let it add up.
 
 ```
 your client  ──►  Robin  ──┬──►  ark/deepseek-v4-flash         (plan A: own window)
@@ -17,147 +15,123 @@ your client  ──►  Robin  ──┬──►  ark/deepseek-v4-flash        
  completions)
 ```
 
-## What's actually different
+```bash
+pip install robin-router
+robin --init      # writes starter config into the current directory
+robin --check     # says which endpoints are usable, and why the rest are not
+robin             # http://127.0.0.1:8080/v1
+```
 
-Sticky routing is not new and neither is load balancing. LiteLLM's router
-spreads proactively (weighted shuffle, lowest-TPM, latency) and can pin by API
-key or `session_id`; Portkey has sticky load balancing on a configured
-`hash_fields`; Kong does consistent hashing on a header. The key-pool rotators
-(`dsh-api-key-pool` and friends) are the ones that move only on failure.
+## How it routes
 
-Two things are still unserved:
+**The unit is the conversation, not the request.** The same conversation keeps
+hitting the same plan; a new conversation starts on the next one. Quota
+spreads, and the provider-side prefix cache survives — an agent replays its
+whole transcript every turn, so a per-*call* decision turns a cache hit into
+full-price prefill and costs more than a second plan saves.
 
-- **Those gateways spread by tokens, requests or dollars — never by a
-  subscription *window*.** A 5-hour bucket that refills when the provider says
-  so, and is worth nothing if it expires unspent, is a different unit from
-  TPM. If you hold three plans, that unit is the whole reason you hold them.
-- **Every sticky implementation above needs the caller to hand over an
-  identity** — an API key, a `session_id`, a header. Robin derives one from
-  the request itself, so an unmodified OpenAI client gets stickiness with no
-  cooperation at all.
+Robin recognises a conversation from its own content — the system prompt plus
+the first user message — so an unmodified client gets this with no cooperation
+and no session id to pass.
 
-(Closest prior art, and worth your time if it fits: `claude-relay-service` and
-`ccflare` do window-aware account pooling for Claude subscriptions
-specifically — `claude-relay-service` derives its session hash much the way
-Robin does. Robin's difference is that it is local, single-process, and works
-for any OpenAI-compatible plan.)
+**A spent window is parked until it reopens.** Robin reads the provider's own
+`Retry-After` or stated reset instant and skips that endpoint until then,
+rather than re-paying the same doomed call on every request. Burst throttling
+and an exhausted plan are both HTTP 429, and the distinction is inferred from
+the response — so `GET /stats` shows what is parked and `POST /unpark`
+releases it if the guess was wrong.
 
-Robin moves on **conversation boundaries**, and gets two things right:
+**Pay-as-you-go is the tail, never a peer.** Endpoints listed under `fallback`
+are tried only when every plan in the pool has failed or is parked. They are
+what turns "everything stops until the window resets" into "the next request
+goes elsewhere".
 
-- **Prefix stickiness.** Provider prefix caches are per-provider, and agent
-  workloads replay the whole transcript every turn (measured on one real
-  workload — AItelier's, where this routing layer came from: 26:1 prefill:decode at an 89.4% cache hit rate). Rotating per
-  *call* converts cached input into full-price input and costs more than a
-  second plan saves. Robin keys on the conversation prefix: the same
-  conversation stays on the same endpoint, a NEW one starts on the next plan.
-  Quota spreads; caches survive.
-- **Spent-window parking.** A plan whose window is spent is parked until the
-  provider's own stated reset instant, keyed on `provider/model` — so later
-  requests skip it instead of re-paying the same doomed call. Burst throttling
-  and an exhausted plan are both HTTP 429; only the prose says which.
+## Configure
 
-Pay-as-you-go endpoints are declared as `fallback` and never rotate forward:
-they are what turns "everything stops until the window resets" into "the next
-request goes elsewhere", and money should be the last resort, not a peer.
-
-## What it is not
-
-No cost tracking, no request logging, no persistence across restarts, one
-process. If you want an observability plane or a team gateway, LiteLLM and
-Portkey are the grown-ups. Robin is one job: spend the windows you already
-bought.
-
-**OpenAI protocol only, in and out.** Robin speaks `/v1/chat/completions` and
-forwards to `/v1/chat/completions`. It does not accept Anthropic-format
-(`/v1/messages`) requests, and it cannot route to an endpoint that only serves
-that shape.
-
-In practice that is a per-**reseller** limit, not a per-model one: OpenCode Go,
-for instance, serves DeepSeek/GLM/Kimi over the OpenAI shape but puts Qwen-Max
-and MiniMax behind `/v1/messages` — while the same models are OpenAI-compatible
-straight from the vendor (Alibaba's DashScope `compatible-mode/v1`), which is
-just another provider entry here. So the gap is "that plan's copy of that
-model", not the model. Adding the Anthropic shape is additive (a provider
-gains an `api:` field) rather than a rewrite; it is on the list if people
-want it.
-
-For pooling **Claude** subscriptions specifically, `claude-relay-service` and
-`ccflare` already do that job well.
-
-Nothing here is DeepSeek-specific — any OpenAI-compatible base URL works; the
-shipped examples just happen to be what the author holds.
-
-## Configuration
-
-Robin reads the same two tables AItelier uses, so an existing deployment can
-point a client at Robin with no migration:
+Two files. `robin --init` writes both.
 
 ```jsonc
 // llm_providers.json — a provider is (base_url, key NAME), NOT a vendor.
-// Hold two plans with the same vendor? Register it twice under different names.
+// Two plans with the same vendor? Register it twice under different names;
+// their windows are then tracked, and parked, independently.
 {
-  "ark":        {"base_url": "https://ark.example/api/v3", "api_key_env": "ARK_API_KEY"},
-  "opencodego": {"base_url": "https://opencode.ai/zen/go/v1", "api_key_env": "GO_API_KEY"}
+  "ark":        {"base_url": "https://ark.example/api/v3",     "api_key_env": "ARK_API_KEY"},
+  "opencodego": {"base_url": "https://opencode.ai/zen/go/v1",  "api_key_env": "GO_API_KEY"},
+  "deepseek":   {"base_url": "https://api.deepseek.com/v1",    "api_key_env": "DEEPSEEK_API_KEY"}
 }
 ```
 
 ```jsonc
-// model_routes.json — a MODEL is an ordered list of ENDPOINTS.
+// model_routes.json — a MODEL is what clients ask for; it names ENDPOINTS.
 {
+  // rotate: one plan per new conversation.  fallback: only when all else fails.
   "flash": {"rotate":   ["ark/deepseek-v4-flash", "opencodego/deepseek-v4-flash"],
-            "fallback": ["deepseek/deepseek-v4-flash"]}
+            "fallback": ["deepseek/deepseek-v4-flash"]},
+
+  // A plain list is ordered failover with no rotation.
+  "local": ["localvllm/qwen3.8-27b"]
 }
 ```
 
-Keys are read from files (`~/.robin-secrets/<NAME>`, or `$ROBIN_SECRETS_DIR`),
-never from the config and never from the environment — so a config is safe to
-share, and a subprocess that inherits the environment does not receive your
-keys. See `.env.example`. A key name with **no file** means "I do not hold this
-plan": Robin skips that endpoint rather than burning a call that cannot
-succeed.
-
-## Run it
+Keys live in files, one per key name:
 
 ```bash
-pip install -e .
-
-cp llm_providers.example.json llm_providers.json   # who you can call
-cp model_routes.example.json  model_routes.json    # which plans serve what
-
 mkdir -p ~/.robin-secrets && chmod 700 ~/.robin-secrets
 ( umask 077; printf '%s' "<your-key>" > ~/.robin-secrets/ARK_API_KEY )
-
-robin --check      # says which endpoints are usable, and why the rest are not
-robin              # http://127.0.0.1:8080/v1
 ```
 
-```bash
-pip install robin-router && robin --init && robin --check
-```
+`api_key_env` names the file. Nothing reads a key from the config or the
+environment, so a config is safe to share and a subprocess that inherits the
+environment never receives your keys. **A key name with no file means "I do not
+hold this plan"** — Robin skips that endpoint instead of burning a call that
+cannot succeed, so adding or dropping a plan is one file, no restart.
+
+## Use
 
 Point any client that speaks `/v1/chat/completions` at
-`http://127.0.0.1:8080/v1` and ask for a **route name** (`flash`, `pro`) as the
-model. Streaming works. `/v1/completions` and `/v1/embeddings` do not exist yet.
+`http://127.0.0.1:8080/v1` and ask for a **route name** (`flash`) as the model.
+Streaming works.
 
-| endpoint | what it's for |
+| endpoint | |
 |---|---|
 | `GET /health` | routes and providers loaded |
-| `GET /stats` | rotation cursors, live conversations, and what is parked — the answer to "why is everything landing on the expensive endpoint" |
-| `GET /v1/models` | the route names, for clients that populate a picker |
-| `POST /reload` | re-read both tables without dropping conversations or parks; a broken edit is refused and the old config keeps serving |
-| `POST /unpark` | release a park (`?endpoint=…`, or all) — parking is inferred from provider prose and can be wrong |
-| `x-robin-endpoint` header, `robin.served_by` in the body | which plan actually served this turn |
+| `GET /stats` | rotation cursors, live conversations, and what is parked |
+| `GET /v1/models` | the route names, for clients with a model picker |
+| `POST /reload` | re-read both tables; conversations and parks survive, and a broken edit is refused with the old config still serving |
+| `POST /unpark` | release a park — one `?endpoint=…`, or all |
+| `x-robin-endpoint` header · `robin.served_by` in the body | which plan served this turn |
 
-Key files need no reload: they are read per call, so writing a new plan's
-key takes effect on the next request.
+Settings are environment variables: `ROBIN_HOST`, `ROBIN_PORT`,
+`ROBIN_SECRETS_DIR`, `ROBIN_PROVIDERS`, `ROBIN_ROUTES`, `ROBIN_API_KEY_FILE`
+(see `.env.example`). Robin does not read a `.env` file — export them, or set
+them in whatever starts it.
 
-Settings are environment variables (`ROBIN_HOST`, `ROBIN_PORT`,
-`ROBIN_SECRETS_DIR`, `ROBIN_PROVIDERS`, `ROBIN_ROUTES`, `ROBIN_API_KEY_FILE`) —
-see `.env.example` for what each does. Robin does **not** read a `.env` file;
-export them, or put them in whatever unit file starts it.
+Robin listens on loopback and holds every key you own. Put auth in front of it
+before binding it anywhere else.
 
-Robin listens on loopback by default and holds every key you own. Put auth in
-front of it (or set `ROBIN_API_KEY_FILE`) before binding it to anything else.
+## What it is not
+
+v0.1, and one job: spend the windows you already bought. No cost tracking, no
+request logging, no persistence across restarts, one process. For an
+observability plane or a team gateway, LiteLLM and Portkey are the grown-ups —
+and they load-balance proactively and can pin traffic too, by API key, session
+id or header. What they measure is tokens, requests and dollars; Robin
+measures the subscription window.
+
+**OpenAI protocol only**, in and out. Anthropic-format (`/v1/messages`)
+requests are not accepted and endpoints that only serve that shape cannot be
+routed to. For pooling **Claude** subscriptions specifically,
+[claude-relay-service](https://github.com/Wei-Shaw/claude-relay-service) and
+[ccflare](https://github.com/snipeship/ccflare) already do that job well.
+
+Nothing here is DeepSeek-specific — any OpenAI-compatible base URL works,
+including a local vLLM or Ollama box.
+
+## Develop
+
+```bash
+pip install -e ".[dev]" && pytest -q
+```
 
 ## Licence
 
