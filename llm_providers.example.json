@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "EXAMPLE. Copy to llm_providers.json and edit — the real file is gitignored.",
+    "A provider is a (base_url, key NAME) pair, NOT a vendor. Holding two token",
+    "plans with the same vendor needs no code: register it twice under different",
+    "names with different api_key_env and list both in a route's rotate pool —",
+    "the spent-window cooldown keys on provider/model, so the plans park apart.",
+    "The KEY ITSELF never appears here: only the name of the file to read it from."
+  ],
+  "ark": {
+    "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "api_key_env": "ARK_API_KEY"
+  },
+  "opencodego": {
+    "base_url": "https://opencode.ai/zen/go/v1",
+    "api_key_env": "GO_API_KEY"
+  },
+  "deepseek": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_env": "DEEPSEEK_API_KEY"
+  },
+  "local": {
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key_env": "LOCAL_API_KEY"
+  }
+}

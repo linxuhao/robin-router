@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+# Deployment config — like .env. Ship examples, never answers.
+llm_providers.json
+model_routes.json
