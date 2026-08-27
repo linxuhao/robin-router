@@ -11,6 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from robin.config import Providers, Routes
+from robin import server as server_mod
 from robin.server import _fails_over, create_app
 
 
@@ -33,15 +34,15 @@ def app_with(tables, monkeypatch):
 
         app = create_app(Providers(tmp_path / "llm_providers.json"),
                          Routes(tmp_path / "model_routes.json"))
-        transport = httpx.MockTransport(handler)
-
-        original = httpx.AsyncClient.__init__
-
-        def patched(self, *a, **kw):
-            kw["transport"] = transport
-            original(self, *a, **kw)
-
-        monkeypatch.setattr(httpx.AsyncClient, "__init__", patched)
+        # Inject by REBINDING the module's client factory, not by patching
+        # httpx.AsyncClient.__init__. The patch version captured `original`
+        # AFTER a previous build() had already patched it, so a second app in
+        # one test silently kept the FIRST script — which made the throttle
+        # assertion pass without the throttle body ever being sent. A test
+        # that cannot fail is worse than no test, and it was guarding the
+        # least certain heuristic in the codebase.
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(server_mod, "_client", lambda _state: client)
         return app, calls
 
     return build
@@ -125,11 +126,22 @@ def test_a_spent_window_parks_and_a_throttle_does_not(app_with):
         _ask(client)
         assert client.get("/stats").json()["parked"]
 
-    app, _ = app_with([(429, {"error": {"message":
-                       "The tpm quota for this model has been exceeded"}}, None),
-                       (200, _OK, None)])
+    # This body is the one that NEEDS the veto: it matches the spend pattern
+    # ("Quota exceeded") and is a per-minute ceiling that clears in seconds.
+    # An earlier version of this test used Ark's "tpm quota ... exceeded",
+    # where the spend words are not adjacent — so it never reached the veto
+    # and stayed green with the veto deleted.
+    app, calls = app_with([(429, {"error": {"message":
+                           "Quota exceeded for quota metric 'requests per minute'"}},
+                           None),
+                           (200, _OK, None)])
     with TestClient(app) as client:
         _ask(client)
+        # The second app must actually run its OWN script; the first harness
+        # silently reused the first one, so this assertion held for the wrong
+        # reason and survived deleting the throttle veto entirely.
+        assert calls, "the throttle body was never sent — harness reuse"
+        assert "tpm" in json.dumps(calls) or len(calls) >= 1
         assert client.get("/stats").json()["parked"] == {}
 
 
@@ -205,3 +217,62 @@ def test_reload_refuses_a_broken_edit_and_keeps_serving(app_with, tables):
             {"flash": ["a/m"], "extra": ["b/m"]}))
         assert client.post("/reload").json()["models"] == ["extra", "flash"]
         assert client.get("/v1/models").json()["data"][0]["id"] == "extra"
+
+
+# ── release-blocking behaviours ────────────────────────────────────────────
+
+def test_the_pay_as_you_go_tail_is_reachable_with_a_full_pool(app_with):
+    """A flat 3-attempt cap was consumed by a 3-plan rotate pool, so the
+    escape hatch the whole design promises ("the next request goes elsewhere")
+    was never reached on exactly the deployment the README recruits."""
+    app, calls = app_with([(500, {"error": "plan down"}, None),
+                           (500, {"error": "plan down"}, None),
+                           (500, {"error": "plan down"}, None),
+                           (200, _OK, None)])
+    with TestClient(app) as client:
+        r = _ask(client)
+    assert r.status_code == 200
+    assert len(calls) == 4
+    assert "p.test" in calls[-1]["url"], calls[-1]["url"]   # the payg provider
+
+
+def test_a_non_stream_body_on_the_streaming_path_fails_over(app_with):
+    """The buffered path already refused a gateway page with a 200; leaving
+    the streaming path open meant the client got a 200 SSE response whose body
+    was HTML, with no failover — the path agent clients use by default."""
+    good = ("data: " + json.dumps({"model": "u", "choices": [{"delta": {}}]})
+            + "\n\ndata: [DONE]\n\n")
+    app, calls = app_with([(200, "<html>502</html>", {"content-type": "text/html"}),
+                           (200, good, {"content-type": "text/event-stream"})])
+    with TestClient(app) as client:
+        r = _ask(client, stream=True)
+    assert "html" not in r.text
+    assert "[DONE]" in r.text
+    assert len(calls) == 2
+
+
+def test_the_token_gate_covers_every_route_not_just_completions(app_with,
+                                                               tmp_path,
+                                                               monkeypatch):
+    """/reload re-reads files from disk, /unpark clears cooldowns, /stats
+    enumerates your endpoints. Gating only the completion route made the
+    README's own "or set ROBIN_API_KEY_FILE" a false comfort."""
+    token = tmp_path / "robin_token"
+    token.write_text("s3cret")
+    monkeypatch.setenv("ROBIN_API_KEY_FILE", str(token))
+    app, _ = app_with([(200, _OK, None)])
+    with TestClient(app) as client:
+        for method, path in (("get", "/stats"), ("get", "/health"),
+                             ("post", "/reload"), ("post", "/unpark")):
+            assert getattr(client, method)(path).status_code == 401, path
+        assert _ask(client).status_code == 401
+        ok = {"Authorization": "Bearer s3cret"}
+        assert client.get("/stats", headers=ok).status_code == 200
+
+
+def test_the_unknown_model_error_does_not_leak_a_home_directory(app_with):
+    """It lands in screenshots and pasted client logs."""
+    app, _ = app_with([(200, _OK, None)])
+    with TestClient(app) as client:
+        msg = _ask(client, model="nope").json()["error"]["message"]
+    assert "/home/" not in msg and "model_routes" in msg

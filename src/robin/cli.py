@@ -5,6 +5,9 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
+
+from . import __version__
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,10 +19,16 @@ def main(argv: list[str] | None = None) -> int:
                              "every key you own; do not expose it without auth)")
     parser.add_argument("--port", type=int,
                         default=int(os.getenv("ROBIN_PORT", "8080")))
-    parser.add_argument("--providers", default=None)
-    parser.add_argument("--routes", default=None)
+    parser.add_argument("--providers", default=None,
+                        help="path to llm_providers.json")
+    parser.add_argument("--routes", default=None,
+                        help="path to model_routes.json")
     parser.add_argument("--check", action="store_true",
                         help="validate the tables and key files, then exit")
+    parser.add_argument("--init", action="store_true",
+                        help="write starter config tables here, then exit")
+    parser.add_argument("--version", action="version",
+                        version=f"robin {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -27,7 +36,19 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    from .config import ConfigError, Providers, Routes
+    from .config import (ConfigError, Providers, Routes, secrets_dir,
+                         write_starter_tables)
+
+    if args.init:
+        written = write_starter_tables(Path.cwd())
+        for p in written:
+            print(f"wrote {p.name}")
+        if not written:
+            print("llm_providers.json and model_routes.json already exist "
+                  "— nothing written.")
+        print(f"\nEdit them, then put your keys in {secrets_dir()}/ "
+              f"(one file per key name) and run `robin --check`.")
+        return 0
 
     try:
         providers = Providers(args.providers)
@@ -56,7 +77,7 @@ def _check(providers, routes) -> int:
     actually able to use" is the question every misconfiguration reduces to,
     and answering it at startup is cheaper than discovering it mid-run.
     """
-    from .config import split_endpoint
+    from .config import secrets_dir, split_endpoint
 
     bad = routes.validate_against(providers)
     dead_models: list[str] = []
@@ -91,9 +112,10 @@ def _check(providers, routes) -> int:
         # has no usable candidate but `flash` does is broken for every request
         # that asks for `pro`, and a green pre-flight check that says
         # otherwise is worse than no check.
-        print(f"\nNo usable endpoint for: {', '.join(dead_models)}. "
-              f"Every candidate is missing its key file or names an "
-              f"unregistered provider. See .env.example.", file=sys.stderr)
+        print(f"\nNo usable endpoint for: {', '.join(dead_models)}.\n"
+              f"Write each key to {secrets_dir()}/<KEY_NAME> (chmod 600) — "
+              f"the KEY_NAME is the one shown against each endpoint above.",
+              file=sys.stderr)
         return 1
     if bad:
         return 1

@@ -25,7 +25,11 @@ _RESET_RE = re.compile(
 _SPENT_RE = re.compile(
     r"usage limit|out of credit|insufficient balance|insufficient credit"
     r"|plan .*exhaust|exceeded your current|monthly limit|weekly limit"
-    r"|5[- ]hour limit|quota exhausted|quota exceeded", re.I)
+    r"|5[- ]hour limit|quota exhausted|quota exceeded"
+    # A per-DAY cap is a window like any other: it does not clear in seconds,
+    # so re-probing it costs one call per request until midnight. The veto
+    # below still excludes the sub-minute ceilings that DO clear on their own.
+    r"|daily limit|per[- ]day|\brpd\b", re.I)
 
 # A THROTTLE wears the same words as a spent plan. Ark says "the tpm quota for
 # this model has been exceeded"; Google says "Quota exceeded for quota metric
@@ -34,9 +38,15 @@ _SPENT_RE = re.compile(
 # on the primary plan, during exactly the burst that tripped it. The asymmetry
 # decides: wrongly parking costs real throughput, wrongly retrying costs one
 # call. So a rate word vetoes the spend words.
+# NARROW on purpose. An earlier version vetoed on `requests? per` and `too
+# many requests`, which also matched per-DAY caps ("Limit 200 requests per
+# day, Used 200") and the plain 429 reason phrase that gateways echo into the
+# body — so a genuinely spent plan was never parked and got re-probed on every
+# request for the rest of the day: the per-call tax this module exists to
+# remove, reintroduced by its own safety valve. Only sub-minute windows, which
+# clear on their own in seconds, may veto.
 _THROTTLE_RE = re.compile(
-    r"\btpm\b|\brpm\b|per[- ]minute|per[- ]second|requests? per"
-    r"|too many requests|concurren", re.I)
+    r"\btpm\b|\brpm\b|per[- ](?:minute|second)|concurren", re.I)
 
 _MAX_S = 6 * 3600      # never trust one report further than this
 _FALLBACK_S = 300      # provider named no instant
@@ -100,11 +110,32 @@ class Cooldowns:
 
     def __init__(self):
         self._until: dict[str, float] = {}
+        self._why: dict[str, str] = {}
 
     def available(self, endpoint: str) -> bool:
         return self._until.get(endpoint, 0.0) <= time.time()
 
-    def park(self, endpoint: str, text: str, retry_after: str = "") -> float:
+    def reason(self, endpoint: str) -> str:
+        """Why this endpoint is parked. '' when it is not.
+
+        Kept because the reasons are not interchangeable: a spent window
+        reopens on its own, a rejected credential does not. Reporting both as
+        "window spent" made /stats lie and made the degrade path prefer an
+        endpoint that is known to be dead.
+        """
+        return self._why.get(endpoint, "") if not self.available(endpoint) else ""
+
+    # Parks that waiting alone will not clear: they need a human to rotate a
+    # key or top up a balance. The degrade path must not prefer one of these
+    # over a spent window that genuinely reopens.
+    _NEEDS_A_HUMAN = frozenset({"credential rejected", "balance drained"})
+
+    def recoverable(self, endpoint: str) -> bool:
+        """Will waiting fix it?"""
+        return self.reason(endpoint) not in self._NEEDS_A_HUMAN
+
+    def park(self, endpoint: str, text: str, retry_after: str = "",
+             why: str = "window spent") -> float:
         """Park `endpoint` until the provider says it reopens.
 
         `Retry-After` first when present: it is a header with one meaning,
@@ -118,6 +149,7 @@ class Cooldowns:
             when = now + _FALLBACK_S
         when = min(when, now + _MAX_S)
         self._until[endpoint] = when
+        self._why[endpoint] = why
         return when
 
     def unpark(self, endpoint: str | None = None) -> list[str]:
@@ -132,7 +164,9 @@ class Cooldowns:
         if endpoint is None:
             released = sorted(self.active())
             self._until.clear()
+            self._why.clear()
             return released
+        self._why.pop(endpoint, None)
         return [endpoint] if self._until.pop(endpoint, None) else []
 
     def active(self) -> dict[str, float]:

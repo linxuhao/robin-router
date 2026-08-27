@@ -127,13 +127,24 @@ class Router:
         with self._lock:
             self._rot[model] = (i + 1) % n
 
-    def _stranded_on_fallback(self, model: str, pinned: str,
-                              cands: list[str]) -> bool:
-        """Is this pin in the paid tail while a pool plan has come back?"""
+    def _stranded(self, model: str, pinned: str, cands: list[str]) -> bool:
+        """Has something this conversation would have PREFERRED come back?
+
+        Two shapes, one question. A rotate route prefers any pool member over
+        the paid tail. A plain list is ordered failover — "bind the first" —
+        so it prefers anything earlier than where the conversation ended up.
+        The first version of this check bailed on `n <= 0`, which is exactly
+        the plain-list shape the README draws (plan A → plan B → pay-as-you-go
+        last): the rejoin never fired there, and a run that began during a
+        park billed to the paid endpoint for its whole life — verbatim the
+        thing the check was added to stop.
+        """
+        i = cands.index(pinned)
         n = self.routes.rotate_size(model)
-        if n <= 0 or cands.index(pinned) < n:
-            return False
-        return any(self._usable(c) is None for c in cands[:n])
+        preferred = cands[:n] if n > 0 else cands[:i]
+        if n > 0 and i < n:
+            return False        # already in the pool; peers, not preferences
+        return any(self._usable(c) is None for c in preferred)
 
     def _usable(self, endpoint: str) -> str | None:
         """None if usable, else why not — the reason is worth reporting."""
@@ -146,7 +157,7 @@ class Router:
             # guaranteed auth failure; skipping it is what the absence means.
             return f"no key ({key_env})"
         if not self.cooldowns.available(endpoint):
-            return "window spent"
+            return f"parked ({self.cooldowns.reason(endpoint)})"
         return None
 
     # ── the decision ───────────────────────────────────────────────────────
@@ -164,10 +175,17 @@ class Router:
 
         cands = self.routes.candidates(model)
         pinned = self._sticky_get(convo, model)
+        if pinned is not None and pinned not in cands:
+            # The table changed under us (a /reload that renamed endpoints).
+            # A pin that names nothing is not a pin: leaving it set made every
+            # affected conversation re-pick at the cursor head AND kept the
+            # cursor still, so the whole pool collapsed onto one plan on the
+            # first turn after any such reload.
+            pinned = None
         rejoining = False
-        if pinned and pinned not in exclude and pinned in cands:
+        if pinned and pinned not in exclude:
             if self._usable(pinned) is None:
-                if not self._stranded_on_fallback(model, pinned, cands):
+                if not self._stranded(model, pinned, cands):
                     return pinned, []
                 # Pinned to the pay-as-you-go tail (every plan was parked when
                 # this conversation started) and a plan has since reopened.
@@ -182,6 +200,7 @@ class Router:
 
         skipped: list[str] = []
         first_keyed: str | None = None
+        first_recoverable: str | None = None
         # A conversation this model has never served (or one rejoining the
         # pool) takes a turn in the rotation. A re-pick after a failure does
         # not: `exclude` marks it, and it must not drag everyone's start along.
@@ -196,17 +215,32 @@ class Router:
                     self._advance_past(model, endpoint)
                 return endpoint, skipped
             skipped.append(f"{endpoint}: {why}")
-            if why == "window spent" and first_keyed is None:
-                first_keyed = endpoint     # parked, but it HAS a key
+            if why.startswith("parked"):
+                # Parked, but it has a key. Prefer one that will RECOVER: a
+                # spent window reopens on its own, a rejected credential does
+                # not, so "the first might answer" is false for the latter.
+                if self.cooldowns.recoverable(endpoint):
+                    if first_recoverable is None:
+                        first_recoverable = endpoint
+                elif first_keyed is None:
+                    first_keyed = endpoint
 
         # Everything is parked or unusable. Degrade to "try it anyway" rather
         # than refuse: parking is parsed from provider prose and can be wrong,
         # and a misread timestamp must never make the router unusable. Prefer
         # a parked-but-keyed endpoint over a keyless one — the first might
         # answer, the second cannot.
-        if first_keyed is not None:
-            self._sticky_set(convo, model, first_keyed)
-            return first_keyed, skipped
+        degraded = first_recoverable or first_keyed
+        if degraded is not None:
+            self._sticky_set(convo, model, degraded)
+            if fresh:
+                # The degrade is an exit from `pick` like any other, and it
+                # was the ONE exit that did not advance the cursor: with the
+                # whole pool parked (the steady state this product assumes)
+                # every new conversation piled onto the same endpoint, so a
+                # misparsed park was never re-probed on the other plans.
+                self._advance_past(model, degraded)
+            return degraded, skipped
         raise NoEndpoint(model, skipped)
 
     # ── stickiness ─────────────────────────────────────────────────────────
@@ -229,14 +263,17 @@ class Router:
         now = time.time()
         with self._lock:
             if len(self._sticky) >= _STICKY_MAX:
-                # Drop what has aged out; if that frees nothing, drop it all.
-                # These are one-hour hints: losing them costs each live
-                # conversation one re-pick, and a wrong eviction policy here
-                # would be more code than the cache.
                 self._sticky = {k: v for k, v in self._sticky.items()
                                 if now - v[1] <= _STICKY_TTL_S}
                 if len(self._sticky) >= _STICKY_MAX:
-                    self._sticky.clear()
+                    # Drop the OLDEST quarter, never the whole table. Clearing
+                    # it re-rolled every live conversation at once — a cliff
+                    # rather than an eviction, and it lands hardest on the
+                    # client that fills the table fastest, which is the one
+                    # whose conversations are being cut short.
+                    ordered = sorted(self._sticky.items(), key=lambda kv: kv[1][1])
+                    for k, _ in ordered[:max(1, _STICKY_MAX // 4)]:
+                        self._sticky.pop(k, None)
             self._sticky[(convo, model)] = (endpoint, now)
 
     def forget(self, convo: str, model: str) -> None:

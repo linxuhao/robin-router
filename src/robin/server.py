@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -47,10 +47,19 @@ log = logging.getLogger("robin")
 # failures. Connect stays short — an unreachable endpoint should fail over fast.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
 
-# How many endpoints one request may try before giving up. Not the whole list:
-# a client waiting on a doomed request wants an answer, and every attempt costs
-# it latency.
-_MAX_ATTEMPTS = 3
+# How many endpoints one request may try before giving up. A floor, not a cap
+# on the pool: with three plans and a flat 3, the rotate pool consumed every
+# attempt and the pay-as-you-go tail — the whole point of configuring one —
+# was never reached, on exactly the deployment the README recruits ("add as
+# many plans as you hold"). Enough to walk the pool plus one escape hatch.
+_MIN_ATTEMPTS = 3
+
+
+def _attempts_for(routes, model: str) -> int:
+    try:
+        return max(_MIN_ATTEMPTS, routes.rotate_size(model) + 1)
+    except KeyError:
+        return _MIN_ATTEMPTS
 
 
 def _fails_over(status: int) -> bool:
@@ -113,15 +122,25 @@ def create_app(providers: Providers | None = None,
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        state["client"] = httpx.AsyncClient(timeout=_TIMEOUT,
-                                            follow_redirects=False)
+        _client(state)
         try:
             yield
         finally:
-            await state.pop("client").aclose()
+            existing = state.pop("client", None)
+            if existing is not None:
+                await existing.aclose()
 
     app = FastAPI(title="Robin", version=__version__, lifespan=lifespan)
-    api = APIRouter()
+    def _gate(request: Request):
+        # On the WHOLE router, not just completions: /reload re-reads files
+        # from disk, /unpark clears your cooldowns and /stats enumerates your
+        # endpoints. Gating only the completion route made the README's own
+        # "or set ROBIN_API_KEY_FILE" escape hatch a false comfort.
+        if not _client_authorized(request):
+            raise HTTPException(status_code=401, detail=(
+                "Robin requires a bearer token (ROBIN_API_KEY_FILE)"))
+
+    api = APIRouter(dependencies=[Depends(_gate)])
 
     @api.get("/health")
     async def health():
@@ -167,8 +186,12 @@ def create_app(providers: Providers | None = None,
         """
         nonlocal providers, routes
         try:
-            new_providers = Providers(providers.path)
-            new_routes = Routes(routes.path)
+            # `requested`, not `path`: `path` is what config_or_example
+            # RESOLVED at boot, which may be the shipped example. Re-resolving
+            # that meant a reload after writing the real file kept serving the
+            # placeholder — and reported {"reloaded": true} while doing it.
+            new_providers = Providers(providers.requested)
+            new_routes = Routes(routes.requested)
         except ConfigError as e:
             return JSONResponse(status_code=400, content={"error": {
                 "message": f"reload refused, previous config still active: {e}",
@@ -198,10 +221,6 @@ def create_app(providers: Providers | None = None,
 
     @api.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        if not _client_authorized(request):
-            return JSONResponse(status_code=401, content={"error": {
-                "message": "Robin requires a bearer token (ROBIN_API_KEY_FILE)",
-                "type": "invalid_request_error"}})
         try:
             body: dict[str, Any] = json.loads(await request.body())
         except ValueError:
@@ -220,14 +239,14 @@ def create_app(providers: Providers | None = None,
         tried: set[str] = set()
         last: tuple[int, str] | None = None
 
-        for _ in range(_MAX_ATTEMPTS):
+        for _ in range(_attempts_for(routes, wanted)):
             try:
                 endpoint, skipped = router.pick(wanted, convo,
                                                 exclude=frozenset(tried))
             except KeyError:
                 return JSONResponse(status_code=400, content={"error": {
                     "message": (f"unknown model '{wanted}'. Robin serves the "
-                                f"routes in {routes.path}: "
+                                f"routes in {os.path.basename(str(routes.path))}: "
                                 f"{', '.join(routes.names())}"),
                     "type": "invalid_request_error"}})
             except NoEndpoint as e:
@@ -251,7 +270,7 @@ def create_app(providers: Providers | None = None,
                 headers["authorization"] = f"Bearer {key}"
 
             url = providers.base_url(provider) + "/chat/completions"
-            client = state["client"]
+            client = _client(state)
 
             try:
                 req = client.build_request("POST", url, json=payload,
@@ -270,7 +289,8 @@ def create_app(providers: Providers | None = None,
                 await resp.aclose()
                 park_for = _park_reason(resp.status_code, text)
                 if park_for:
-                    until = router.cooldowns.park(endpoint, text, retry_after)
+                    until = router.cooldowns.park(endpoint, text, retry_after,
+                                                  why=park_for)
                     log.warning("parked %s until %s (%s)", endpoint,
                                 time.strftime("%H:%M:%S", time.localtime(until)),
                                 park_for)
@@ -284,6 +304,21 @@ def create_app(providers: Providers | None = None,
                 # to an endpoint that just proved unhealthy. This request's own
                 # retry needs nothing from it: `tried`/`exclude` both skips the
                 # failed endpoint and holds the pool cursor still.
+                router.forget(convo, wanted)
+                continue
+
+            ctype = resp.headers.get("content-type", "")
+            if streaming and not ("event-stream" in ctype or "json" in ctype):
+                # A 200 carrying an HTML gateway page is not a stream. The
+                # buffered path already refused this; leaving the streaming
+                # path open meant the client got a 200 SSE response whose body
+                # was the interstitial, with no failover — on the code path
+                # agent clients use by default.
+                await resp.aclose()
+                log.warning("non-stream 2xx from %s (content-type %r)",
+                            endpoint, ctype)
+                last = (502, f"{endpoint}: upstream returned {ctype or 'no'} "
+                             f"content-type for a stream")
                 router.forget(convo, wanted)
                 continue
 
@@ -340,6 +375,20 @@ def _as_error(text: str, endpoint: str) -> dict:
     return parsed
 
 
+def _client(state: dict) -> httpx.AsyncClient:
+    """The shared client, creating it if lifespan never ran.
+
+    Starlette does not run a mounted sub-app's lifespan, and a TestClient used
+    without `with` skips it too — both left `state` empty and turned every
+    completion into an unexplained KeyError 500.
+    """
+    client = state.get("client")
+    if client is None:
+        client = state["client"] = httpx.AsyncClient(timeout=_TIMEOUT,
+                                                     follow_redirects=False)
+    return client
+
+
 def _park_reason(status: int, text: str) -> str | None:
     """Why this endpoint should be parked, or None to just fail over.
 
@@ -353,8 +402,15 @@ def _park_reason(status: int, text: str) -> str | None:
         return "window spent"
     if status == 402:
         return "balance drained"
-    if status in (401, 403):
+    if status == 401:
         return "credential rejected"
+    # 403 deliberately NOT parked. It fails over — another plan may serve —
+    # but it is request-shaped as often as endpoint-shaped: a WAF in front of
+    # a reseller, a region block, a content policy. Parking it let ONE request
+    # that drew 403 from every candidate park the entire pool (measured), and
+    # then every other conversation degraded to pay-as-you-go for five
+    # minutes. Wrongly parking costs capacity you are paying for; wrongly
+    # retrying costs one call.
     return None
 
 

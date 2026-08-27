@@ -167,3 +167,58 @@ def test_a_failed_attempt_does_not_advance_the_cursor_twice(router):
     second, _ = router.pick("flash", convo, exclude=frozenset({first}))
     assert second != first
     assert router.pick("flash", _c(user="next"))[0] == "b/m"   # not c/m
+
+
+# ── the degrade and the rejoin, on every route shape ───────────────────────
+
+def test_the_degrade_path_also_takes_a_turn_in_the_rotation(router):
+    """It was the one exit from `pick` that never moved the cursor, so with
+    the whole pool parked — the steady state this product assumes — every new
+    conversation piled onto one endpoint and the other plans were never
+    re-probed, even though a misparsed park is exactly why the degrade
+    exists."""
+    for e in ("a/m", "b/m", "c/m", "payg/m"):
+        router.cooldowns.park(e, "quota exhausted")
+    picks = [router.pick("flash", _c(user=f"q{i}"))[0] for i in range(3)]
+    assert len(set(picks)) == 3, picks
+
+
+def test_a_plain_list_route_rejoins_its_preferred_endpoint(router):
+    """Ordered failover means "bind the first". A conversation that fell to
+    the tail while the head was parked must come back when it reopens — the
+    first version of this check bailed on plain lists, so a run that began
+    during a park billed to the paid endpoint for its whole life."""
+    convo = _c(user="plain")
+    router.cooldowns.park("a/m", "quota exhausted")
+    assert router.pick("plain", convo)[0] == "payg/m"
+    router.cooldowns.unpark("a/m")
+    assert router.pick("plain", convo)[0] == "a/m"
+
+
+def test_a_credential_park_is_not_the_preferred_degrade(router, tables):
+    """"The first might answer" is true of a spent window and false of a
+    rejected credential: only one of them recovers by waiting."""
+    router.cooldowns.park("a/m", "", why="credential rejected")
+    router.cooldowns.park("b/m", "", why="window spent")
+    router.cooldowns.park("c/m", "", why="credential rejected")
+    router.cooldowns.park("payg/m", "", why="credential rejected")
+    assert router.pick("flash", _c())[0] == "b/m"
+
+
+def test_a_pin_the_table_no_longer_contains_is_not_a_pin(router, tables):
+    """After a /reload that renames endpoints, a stale pin used to keep
+    `fresh` False — so every affected conversation re-picked at the cursor
+    head AND the cursor never moved: the whole pool collapsed onto one plan."""
+    import json as _json
+    from robin.config import Routes
+    tmp_path, _ = tables
+    convos = [_c(user=f"q{i}") for i in range(3)]
+    before = [router.pick("flash", c)[0] for c in convos]
+    assert len(set(before)) == 3
+
+    (tmp_path / "model_routes.json").write_text(_json.dumps(
+        {"flash": {"rotate": ["a/m2", "b/m2", "c/m2"], "fallback": []},
+         "plain": ["a/m"]}))
+    router.reload(router.providers, Routes(tmp_path / "model_routes.json"))
+    after = [router.pick("flash", c)[0] for c in convos]
+    assert len(set(after)) == 3, after

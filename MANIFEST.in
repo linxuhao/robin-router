@@ -1,0 +1,3 @@
+include LICENSE README.md .env.example
+include llm_providers.example.json model_routes.example.json
+recursive-include tests *.py

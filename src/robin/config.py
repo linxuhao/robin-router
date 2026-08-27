@@ -41,7 +41,15 @@ def config_or_example(name: str) -> Path:
     example = stem.with_name(stem.name + ".example" + p.suffix)
     if example.is_file():
         return example
-    raise ConfigError(f"neither {p} nor {example} exists")
+    # Installed from a wheel there is no checkout to fall back to, and the
+    # first command in the README then failed naming two files the user has
+    # never seen. Ship the examples INSIDE the package as the last resort.
+    packaged = Path(__file__).with_name(example.name)
+    if packaged.is_file():
+        return packaged
+    raise ConfigError(
+        f"neither {p} nor {example} exists. Run `robin --init` to write "
+        f"starter tables into the current directory.")
 
 
 def _load_json(path: Path) -> dict:
@@ -56,6 +64,24 @@ def _load_json(path: Path) -> dict:
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: expected an object at the top level")
     return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
+def write_starter_tables(dest: Path) -> list[Path]:
+    """Copy the packaged examples into `dest` as the real table names.
+
+    Existing files are never overwritten: this is the command a user runs when
+    they are not sure what they have, and clobbering a working config would be
+    the worst possible answer to that question.
+    """
+    written = []
+    for example in ("llm_providers.example.json", "model_routes.example.json"):
+        src = Path(__file__).with_name(example)
+        target = dest / example.replace(".example", "")
+        if target.exists() or not src.is_file():
+            continue
+        target.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        written.append(target)
+    return written
 
 
 def secrets_dir() -> Path:
@@ -82,8 +108,9 @@ class Providers:
     """`name -> {base_url, api_key_env}`."""
 
     def __init__(self, path: str | os.PathLike | None = None):
-        self.path = config_or_example(str(path or os.getenv("ROBIN_PROVIDERS")
-                                          or "llm_providers.json"))
+        self.requested = str(path or os.getenv("ROBIN_PROVIDERS")
+                             or "llm_providers.json")
+        self.path = config_or_example(self.requested)
         self._p = _load_json(self.path)
         for name, cfg in self._p.items():
             if not isinstance(cfg, dict) or not cfg.get("base_url"):
@@ -119,8 +146,9 @@ class Routes:
     """
 
     def __init__(self, path: str | os.PathLike | None = None):
-        self.path = config_or_example(str(path or os.getenv("ROBIN_ROUTES")
-                                          or "model_routes.json"))
+        self.requested = str(path or os.getenv("ROBIN_ROUTES")
+                             or "model_routes.json")
+        self.path = config_or_example(self.requested)
         self._r: dict[str, list[str]] = {}
         self._rot: dict[str, int] = {}
         for name, value in _load_json(self.path).items():

@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "EXAMPLE. Copy to model_routes.json and edit — the real file is gitignored.",
+    "A MODEL is an ordered list of ENDPOINTS. Clients ask for the model NAME",
+    "('flash'); Robin picks which endpoint serves this conversation.",
+    "",
+    "Plain list  -> ordered failover only: bind the first, move down on error.",
+    "Dict form   -> {rotate: [...], fallback: [...]}. Each NEW conversation",
+    "               starts one position further around the rotate pool, so every",
+    "               plan's 5h/weekly window gets used; the conversation itself",
+    "               stays put (prefix caches are per-provider and agent clients",
+    "               replay the whole transcript every turn).",
+    "               fallback is pay-as-you-go: tried only when the whole pool",
+    "               failed or is parked, and NEVER rotated into the head.",
+    "",
+    "Providers named here must exist in llm_providers.json."
+  ],
+  "flash": {
+    "rotate": [
+      "ark/deepseek-v4-flash",
+      "opencodego/deepseek-v4-flash"
+    ],
+    "fallback": [
+      "deepseek/deepseek-v4-flash"
+    ]
+  },
+  "pro": {
+    "rotate": [
+      "ark/deepseek-v4-pro",
+      "opencodego/deepseek-v4-pro"
+    ],
+    "fallback": [
+      "deepseek/deepseek-v4-pro"
+    ]
+  }
+}

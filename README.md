@@ -1,5 +1,7 @@
 # Robin
 
+*v0.1 — early, and honest about it: see [What it is not](#what-it-is-not).*
+
 **Round-robin your LLM subscriptions.** One local OpenAI-compatible endpoint in
 front of every plan you hold — so the 5-hour and weekly windows you already pay
 for all get used, instead of one plan burning out while the others expire idle.
@@ -8,22 +10,39 @@ Born for DeepSeek refugees: instead of hunting for one plan with enough
 capacity, find several whose capacity **adds up** — and let them add up.
 
 ```
-your client  ──►  Robin  ──►  ark/deepseek-v4-flash        (plan A: own window)
-(dsh, opencode,        │      opencodego/deepseek-v4-flash (plan B: own window)
- Claude Code router,   │      …add as many as you hold
- any /v1/chat/    └────► deepseek/deepseek-v4-flash    (pay-as-you-go, last)
- compatible)
+your client  ──►  Robin  ──┬──►  ark/deepseek-v4-flash         (plan A: own window)
+(Claude Code, opencode,    │     opencodego/deepseek-v4-flash  (plan B: own window)
+ dsh — anything that       │     …add as many plans as you hold
+ speaks /v1/chat/          └──►  deepseek/deepseek-v4-flash     (pay-as-you-go, last)
+ completions)
 ```
 
-## What makes it different from a plain key rotator
+## What's actually different
 
-The rotators that exist today move **on failure**: they burn one key to
-exhaustion, take the 429, then try the next. That leaves the other plans'
-windows expiring unused, and it makes the switch happen at the worst possible
-moment — mid-conversation.
+Sticky routing is not new and neither is load balancing. LiteLLM's router
+spreads proactively (weighted shuffle, lowest-TPM, latency) and can pin by API
+key or `session_id`; Portkey has sticky load balancing on a configured
+`hash_fields`; Kong does consistent hashing on a header. The key-pool rotators
+(`dsh-api-key-pool` and friends) are the ones that move only on failure.
 
-Robin moves on **conversation boundaries**, and it knows two things a plain
-rotator does not:
+Two things are still unserved:
+
+- **Those gateways spread by tokens, requests or dollars — never by a
+  subscription *window*.** A 5-hour bucket that refills when the provider says
+  so, and is worth nothing if it expires unspent, is a different unit from
+  TPM. If you hold three plans, that unit is the whole reason you hold them.
+- **Every sticky implementation above needs the caller to hand over an
+  identity** — an API key, a `session_id`, a header. Robin derives one from
+  the request itself, so an unmodified OpenAI client gets stickiness with no
+  cooperation at all.
+
+(Closest prior art, and worth your time if it fits: `claude-relay-service` and
+`ccflare` do window-aware account pooling for Claude subscriptions
+specifically — `claude-relay-service` derives its session hash much the way
+Robin does. Robin's difference is that it is local, single-process, and works
+for any OpenAI-compatible plan.)
+
+Robin moves on **conversation boundaries**, and gets two things right:
 
 - **Prefix stickiness.** Provider prefix caches are per-provider, and agent
   workloads replay the whole transcript every turn (measured on one real
@@ -41,12 +60,15 @@ Pay-as-you-go endpoints are declared as `fallback` and never rotate forward:
 they are what turns "everything stops until the window resets" into "the next
 request goes elsewhere", and money should be the last resort, not a peer.
 
-## Status
+## What it is not
 
-Early. The routing model and the parking logic are lifted from
-[AItelier](https://github.com/linxuhao/AItelier)'s in-process router, where they
-have been driving real multi-day pipeline runs across three subscription plans.
-Robin is that layer made client-agnostic.
+No cost tracking, no request logging, no persistence across restarts, one
+process. If you want an observability plane or a team gateway, LiteLLM and
+Portkey are the grown-ups. Robin is one job: spend the windows you already
+bought.
+
+Nothing here is DeepSeek-specific — any OpenAI-compatible base URL works; the
+shipped examples just happen to be what the author holds.
 
 ## Configuration
 
@@ -86,17 +108,21 @@ cp llm_providers.example.json llm_providers.json   # who you can call
 cp model_routes.example.json  model_routes.json    # which plans serve what
 
 mkdir -p ~/.robin-secrets && chmod 700 ~/.robin-secrets
-printf '%s' "<your-key>" > ~/.robin-secrets/ARK_API_KEY && chmod 600 "$_"
+( umask 077; printf '%s' "<your-key>" > ~/.robin-secrets/ARK_API_KEY )
 
 robin --check      # says which endpoints are usable, and why the rest are not
 robin              # http://127.0.0.1:8080/v1
+```
+
+```bash
+pip install robin-router && robin --init && robin --check
 ```
 
 Point any client that speaks `/v1/chat/completions` at
 `http://127.0.0.1:8080/v1` and ask for a **route name** (`flash`, `pro`) as the
 model. Streaming works. `/v1/completions` and `/v1/embeddings` do not exist yet.
 
-| | |
+| endpoint | what it's for |
 |---|---|
 | `GET /health` | routes and providers loaded |
 | `GET /stats` | rotation cursors, live conversations, and what is parked — the answer to "why is everything landing on the expensive endpoint" |
