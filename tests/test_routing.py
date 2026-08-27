@@ -131,3 +131,39 @@ def test_exclusion_lets_a_caller_retry_past_a_failed_endpoint(router):
     first, _ = router.pick("flash", _c())
     second, _ = router.pick("flash", _c(), exclude=frozenset({first}))
     assert second != first
+
+
+# ── (conversation, model) is the assignment key, not conversation alone ────
+
+def test_two_models_sharing_a_prefix_each_rotate_independently(router):
+    """A coding agent uses a cheap model for subagents and an expensive one
+    for the main thread — same system prompt, so the SAME conversation id.
+    Keyed on the conversation alone, the two fought over one sticky slot and,
+    because `advance` was derived from "is there a pin", the second model's
+    cursor never moved: one whole model stopped rotating and one of its plans
+    expired unused — the exact failure this project exists to prevent."""
+    seen_flash, seen_plain = [], []
+    for i in range(4):
+        convo = _c(user=f"q{i}")
+        seen_flash.append(router.pick("flash", convo)[0])
+        seen_plain.append(router.pick("plain", convo)[0])
+    assert seen_flash == ["a/m", "b/m", "c/m", "a/m"]      # rotates
+    assert seen_plain == ["a/m"] * 4                       # plain list, no pool
+    # And each model keeps its OWN pin for the same conversation.
+    convo = _c(user="shared")
+    f = router.pick("flash", convo)[0]
+    router.pick("plain", convo)
+    assert router.pick("flash", convo)[0] == f             # not clobbered
+
+
+def test_a_failed_attempt_does_not_advance_the_cursor_twice(router):
+    """The server unpins a conversation after an endpoint fails so the retry
+    is not held to it — but that must not read as a brand-new conversation.
+    One failing request used to move the cursor twice, skipping a plan in the
+    rotation every time anything failed."""
+    convo = _c(user="fails")
+    first, _ = router.pick("flash", convo)
+    router.forget(convo, "flash")                  # what the server does
+    second, _ = router.pick("flash", convo, exclude=frozenset({first}))
+    assert second != first
+    assert router.pick("flash", _c(user="next"))[0] == "b/m"   # not c/m

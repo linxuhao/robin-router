@@ -226,7 +226,10 @@ def create_app(providers: Providers | None = None,
                     return JSONResponse(status_code=resp.status_code,
                                         content=_as_error(text, endpoint))
                 last = (resp.status_code, f"{endpoint}: {text[:400]}")
-                router.forget(convo)     # this endpoint is not this convo's home
+                # Unpin so the retry is not held to the endpoint that just
+                # failed; / is what keeps the pool cursor
+                # still while this one request works through its options.
+                router.forget(convo, wanted)
                 continue
 
             if streaming:

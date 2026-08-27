@@ -83,7 +83,14 @@ class Router:
         self.cooldowns = cooldowns or Cooldowns()
         self._lock = threading.Lock()
         self._rot: dict[str, int] = {}                  # model -> rotation cursor
-        self._sticky: dict[str, tuple[str, float]] = {}  # convo -> (endpoint, seen)
+        # (conversation, model) -> (endpoint, last seen). Keyed on BOTH: a
+        # client that asks two models with the same prefix (a coding agent
+        # using a cheap model for subagents and an expensive one for the main
+        # thread shares its system prompt) produced ONE slot the two fought
+        # over — and since `advance` was derived from "is there a pin", the
+        # second model's cursor never moved: one whole model stopped rotating
+        # and one of its plans expired unused. Verified 2026-08-27.
+        self._sticky: dict[tuple[str, str], tuple[str, float]] = {}
 
     # ── candidate order ────────────────────────────────────────────────────
 
@@ -132,7 +139,7 @@ class Router:
         if model not in self.routes:
             raise KeyError(model)
 
-        pinned = self._sticky_get(convo)
+        pinned = self._sticky_get(convo, model)
         if pinned and pinned not in exclude and pinned in self.routes.candidates(model):
             if self._usable(pinned) is None:
                 return pinned, []
@@ -142,12 +149,16 @@ class Router:
 
         skipped: list[str] = []
         first_keyed: str | None = None
-        for endpoint in self._ordered(model, advance=pinned is None):
+        # Advance only for a conversation this model has never served. A
+        # re-pick (its endpoint parked, or the caller excluded it after a
+        # failure) is ONE conversation's problem, not everyone's turn to move.
+        for endpoint in self._ordered(model, advance=pinned is None
+                                      and not exclude):
             if endpoint in exclude:
                 continue
             why = self._usable(endpoint)
             if why is None:
-                self._sticky_set(convo, endpoint)
+                self._sticky_set(convo, model, endpoint)
                 return endpoint, skipped
             skipped.append(f"{endpoint}: {why}")
             if why == "window spent" and first_keyed is None:
@@ -159,26 +170,27 @@ class Router:
         # a parked-but-keyed endpoint over a keyless one — the first might
         # answer, the second cannot.
         if first_keyed is not None:
-            self._sticky_set(convo, first_keyed)
+            self._sticky_set(convo, model, first_keyed)
             return first_keyed, skipped
         raise NoEndpoint(model, skipped)
 
     # ── stickiness ─────────────────────────────────────────────────────────
 
-    def _sticky_get(self, convo: str) -> str | None:
+    def _sticky_get(self, convo: str, model: str) -> str | None:
         now = time.time()
+        key = (convo, model)
         with self._lock:
-            hit = self._sticky.get(convo)
+            hit = self._sticky.get(key)
             if hit is None:
                 return None
             endpoint, seen = hit
             if now - seen > _STICKY_TTL_S:
-                self._sticky.pop(convo, None)
+                self._sticky.pop(key, None)
                 return None
-            self._sticky[convo] = (endpoint, now)
+            self._sticky[key] = (endpoint, now)
             return endpoint
 
-    def _sticky_set(self, convo: str, endpoint: str) -> None:
+    def _sticky_set(self, convo: str, model: str, endpoint: str) -> None:
         now = time.time()
         with self._lock:
             if len(self._sticky) >= _STICKY_MAX:
@@ -190,11 +202,20 @@ class Router:
                                 if now - v[1] <= _STICKY_TTL_S}
                 if len(self._sticky) >= _STICKY_MAX:
                     self._sticky.clear()
-            self._sticky[convo] = (endpoint, now)
+            self._sticky[(convo, model)] = (endpoint, now)
 
-    def forget(self, convo: str) -> None:
+    def forget(self, convo: str, model: str) -> None:
+        """Drop one conversation's assignment for one model.
+
+        The server calls this after an endpoint failed for this conversation,
+        so the retry is not pinned to the endpoint that just failed. It must
+        NOT make the retry look like a brand-new conversation: `pick`'s
+        `exclude` is what keeps the cursor still (one failing request used to
+        advance the cursor TWICE, skipping a plan in the rotation every time
+        anything failed).
+        """
         with self._lock:
-            self._sticky.pop(convo, None)
+            self._sticky.pop((convo, model), None)
 
     def stats(self) -> dict:
         with self._lock:
