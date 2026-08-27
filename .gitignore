@@ -8,3 +8,6 @@ build/
 # Deployment config — like .env. Ship examples, never answers.
 llm_providers.json
 model_routes.json
+
+# A user will make one of these anyway; keys must never ride into git.
+.env

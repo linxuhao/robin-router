@@ -94,23 +94,46 @@ class Router:
 
     # ── candidate order ────────────────────────────────────────────────────
 
-    def _ordered(self, model: str, advance: bool) -> list[str]:
-        """Candidates for `model`, rotated if the route has a pool.
+    def _ordered(self, model: str) -> list[str]:
+        """Candidates for `model`, rotated to the pool's current head.
 
-        `advance` is what separates a new conversation (take the next plan and
-        move the cursor) from a retry of one already assigned (same order, no
-        cursor movement) — otherwise a failing conversation would walk the
-        whole pool and drag every other conversation's starting point with it.
+        Reads the cursor, never moves it: the cursor is set AFTER a pick, from
+        the position actually chosen (`_advance_past`). Bumping it by one here
+        looked equivalent and was not — with one plan parked, the plan after
+        it received every skipped turn as well as its own (measured 2:1 over
+        12 conversations), so it burned twice as fast, parked next, and handed
+        ITS doubled share onward. A cascade that concentrates load exactly
+        when the whole point is to spread it, and parking is the steady state.
         """
         cands = self.routes.candidates(model)
         n = self.routes.rotate_size(model)
         if n <= 1:
             return cands
         with self._lock:
-            k = self._rot.get(model, 0)
-            if advance:
-                self._rot[model] = (k + 1) % n
+            k = self._rot.get(model, 0) % n
         return cands[k:n] + cands[:k] + cands[n:]
+
+    def _advance_past(self, model: str, endpoint: str) -> None:
+        """Next new conversation starts one past the endpoint just handed out."""
+        n = self.routes.rotate_size(model)
+        if n <= 1:
+            return
+        try:
+            i = self.routes.candidates(model).index(endpoint)
+        except ValueError:
+            return
+        if i >= n:
+            return      # the fallback tail is not part of the rotation
+        with self._lock:
+            self._rot[model] = (i + 1) % n
+
+    def _stranded_on_fallback(self, model: str, pinned: str,
+                              cands: list[str]) -> bool:
+        """Is this pin in the paid tail while a pool plan has come back?"""
+        n = self.routes.rotate_size(model)
+        if n <= 0 or cands.index(pinned) < n:
+            return False
+        return any(self._usable(c) is None for c in cands[:n])
 
     def _usable(self, endpoint: str) -> str | None:
         """None if usable, else why not — the reason is worth reporting."""
@@ -139,26 +162,38 @@ class Router:
         if model not in self.routes:
             raise KeyError(model)
 
+        cands = self.routes.candidates(model)
         pinned = self._sticky_get(convo, model)
-        if pinned and pinned not in exclude and pinned in self.routes.candidates(model):
+        rejoining = False
+        if pinned and pinned not in exclude and pinned in cands:
             if self._usable(pinned) is None:
-                return pinned, []
-            # The conversation's endpoint went unusable mid-flight (window
-            # spent). Re-pick WITHOUT advancing the pool cursor: this is one
-            # conversation's problem, not everyone's turn to move.
+                if not self._stranded_on_fallback(model, pinned, cands):
+                    return pinned, []
+                # Pinned to the pay-as-you-go tail (every plan was parked when
+                # this conversation started) and a plan has since reopened.
+                # This is the one stickiness case where holding still costs
+                # money instead of saving it: a long agent run that began
+                # during a park would bill to the paid endpoint for its whole
+                # life. Rejoin the pool and take a real turn in it.
+                rejoining = True
+            # else: the conversation's endpoint went unusable mid-flight.
+            # Re-pick WITHOUT advancing the cursor — one conversation's
+            # problem is not everyone's turn to move.
 
         skipped: list[str] = []
         first_keyed: str | None = None
-        # Advance only for a conversation this model has never served. A
-        # re-pick (its endpoint parked, or the caller excluded it after a
-        # failure) is ONE conversation's problem, not everyone's turn to move.
-        for endpoint in self._ordered(model, advance=pinned is None
-                                      and not exclude):
+        # A conversation this model has never served (or one rejoining the
+        # pool) takes a turn in the rotation. A re-pick after a failure does
+        # not: `exclude` marks it, and it must not drag everyone's start along.
+        fresh = (pinned is None or rejoining) and not exclude
+        for endpoint in self._ordered(model):
             if endpoint in exclude:
                 continue
             why = self._usable(endpoint)
             if why is None:
                 self._sticky_set(convo, model, endpoint)
+                if fresh:
+                    self._advance_past(model, endpoint)
                 return endpoint, skipped
             skipped.append(f"{endpoint}: {why}")
             if why == "window spent" and first_keyed is None:
@@ -207,15 +242,27 @@ class Router:
     def forget(self, convo: str, model: str) -> None:
         """Drop one conversation's assignment for one model.
 
-        The server calls this after an endpoint failed for this conversation,
-        so the retry is not pinned to the endpoint that just failed. It must
-        NOT make the retry look like a brand-new conversation: `pick`'s
-        `exclude` is what keeps the cursor still (one failing request used to
-        advance the cursor TWICE, skipping a plan in the rotation every time
-        anything failed).
+        The server calls this after an endpoint failed, so a LATER request in
+        the same conversation is not pinned to an endpoint that just proved
+        unhealthy. Within one request the retry needs nothing from this:
+        `pick`'s `exclude` both skips the failed endpoint and holds the pool
+        cursor still (a failing request used to advance it TWICE, skipping a
+        plan in the rotation every time anything failed).
         """
         with self._lock:
             self._sticky.pop((convo, model), None)
+
+    def reload(self, providers, routes) -> None:
+        """Swap the tables in place, keeping cursors and assignments.
+
+        Deliberately NOT a new Router: rebuilding one would drop every live
+        conversation's endpoint — a reload during a long agent run would
+        re-roll the dice mid-conversation and throw away the provider-side
+        prefix cache this whole design exists to protect.
+        """
+        with self._lock:
+            self.providers = providers
+            self.routes = routes
 
     def stats(self) -> dict:
         with self._lock:

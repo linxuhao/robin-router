@@ -59,11 +59,12 @@ def _check(providers, routes) -> int:
     from .config import split_endpoint
 
     bad = routes.validate_against(providers)
-    usable_any = False
+    dead_models: list[str] = []
     print(f"providers: {', '.join(providers.names())}")
     for model in routes.names():
         cands = routes.candidates(model)
         n = routes.rotate_size(model)
+        usable_here = False
         print(f"\n{model}:" + ("" if n else "   (ordered failover, no rotation)"))
         for i, endpoint in enumerate(cands):
             provider, _ = split_endpoint(endpoint)
@@ -72,20 +73,29 @@ def _check(providers, routes) -> int:
                 mark, note = "!!", "provider NOT in providers table"
             elif not providers.key_env(provider):
                 mark, note = "ok", "no key required"
-                usable_any = True
+                usable_here = True
             elif providers.key(provider):
                 mark, note = "ok", f"key {providers.key_env(provider)} present"
-                usable_any = True
+                usable_here = True
             else:
                 mark, note = "--", (f"no key file {providers.key_env(provider)}"
                                     f" — will be skipped")
             print(f"  {mark} {slot}  {endpoint:<44} {note}")
+        if not usable_here:
+            dead_models.append(model)
     if bad:
         print(f"\n{len(bad)} candidate(s) name an unregistered provider.",
               file=sys.stderr)
-    if not usable_any:
-        print("\nNo endpoint is usable: every candidate is missing its key "
-              "file. See .env.example.", file=sys.stderr)
+    if dead_models:
+        # Per MODEL, not "did anything anywhere work": a config where `pro`
+        # has no usable candidate but `flash` does is broken for every request
+        # that asks for `pro`, and a green pre-flight check that says
+        # otherwise is worse than no check.
+        print(f"\nNo usable endpoint for: {', '.join(dead_models)}. "
+              f"Every candidate is missing its key file or names an "
+              f"unregistered provider. See .env.example.", file=sys.stderr)
+        return 1
+    if bad:
         return 1
     return 0
 

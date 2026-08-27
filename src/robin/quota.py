@@ -23,17 +23,31 @@ _RESET_RE = re.compile(
 # text matches neither, treat it as a burst: parking an endpoint that was only
 # throttled costs real capacity, while re-trying a spent one costs one call.
 _SPENT_RE = re.compile(
-    r"quota|usage limit|out of credit|insufficient balance|plan .*exhaust"
-    r"|exceeded your current|monthly limit|weekly limit|5[- ]hour limit",
-    re.I)
+    r"usage limit|out of credit|insufficient balance|insufficient credit"
+    r"|plan .*exhaust|exceeded your current|monthly limit|weekly limit"
+    r"|5[- ]hour limit|quota exhausted|quota exceeded", re.I)
+
+# A THROTTLE wears the same words as a spent plan. Ark says "the tpm quota for
+# this model has been exceeded"; Google says "Quota exceeded for quota metric
+# 'requests per minute'". Both are per-minute ceilings that clear in seconds —
+# parking either for the 5-minute default throws away the capacity you pay for,
+# on the primary plan, during exactly the burst that tripped it. The asymmetry
+# decides: wrongly parking costs real throughput, wrongly retrying costs one
+# call. So a rate word vetoes the spend words.
+_THROTTLE_RE = re.compile(
+    r"\btpm\b|\brpm\b|per[- ]minute|per[- ]second|requests? per"
+    r"|too many requests|concurren", re.I)
 
 _MAX_S = 6 * 3600      # never trust one report further than this
 _FALLBACK_S = 300      # provider named no instant
 
 
 def is_spent(text: str) -> bool:
-    """Does this 429/403 body describe an exhausted allowance (not a burst)?"""
-    return bool(_SPENT_RE.search(text or ""))
+    """Does this body describe an exhausted ALLOWANCE, not a burst?"""
+    text = text or ""
+    if _THROTTLE_RE.search(text):
+        return False
+    return bool(_SPENT_RE.search(text))
 
 
 def reset_at(text: str) -> float | None:
@@ -43,11 +57,32 @@ def reset_at(text: str) -> float | None:
         return None
     stamp = m.group(1).replace(" ", "T")
     if not re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", stamp):
-        stamp += "+00:00"      # naive instants from an API are UTC
+        # No offset: unparseable, NOT "assume UTC". Several providers report
+        # local time, and reading a +08:00 instant as UTC parks a healthy plan
+        # eight hours out — clamped to the 6h ceiling, which then bounds the
+        # damage instead of preventing it. Fall back to the short default and
+        # re-probe; that costs one call, the wrong guess costs a whole plan.
+        return None
     try:
         return datetime.datetime.fromisoformat(
             stamp.replace("Z", "+00:00")).timestamp()
     except ValueError:
+        return None
+
+
+def _retry_after_at(value: str, now: float) -> float | None:
+    """`Retry-After` as an epoch: either delta-seconds or an HTTP date."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return now + max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(value).timestamp()
+    except (TypeError, ValueError):
         return None
 
 
@@ -69,19 +104,38 @@ class Cooldowns:
     def available(self, endpoint: str) -> bool:
         return self._until.get(endpoint, 0.0) <= time.time()
 
-    def park(self, endpoint: str, text: str) -> float:
-        """Park `endpoint` until the provider's stated reset (or a default)."""
-        when = reset_at(text)
+    def park(self, endpoint: str, text: str, retry_after: str = "") -> float:
+        """Park `endpoint` until the provider says it reopens.
+
+        `Retry-After` first when present: it is a header with one meaning,
+        while the prose is a sentence a provider is free to reword — and a
+        reworded sentence silently degrades to the 5-minute default, which
+        re-probes a spent plan twelve times an hour.
+        """
         now = time.time()
+        when = _retry_after_at(retry_after, now) or reset_at(text)
         if when is None or when <= now:
             when = now + _FALLBACK_S
         when = min(when, now + _MAX_S)
         self._until[endpoint] = when
         return when
 
+    def unpark(self, endpoint: str | None = None) -> list[str]:
+        """Release one park, or all of them. Returns what was released.
+
+        Parking is inferred from provider prose and headers, so it can be
+        wrong — and a wrong park hides a plan you are paying for. Without
+        this the only remedy was restarting the proxy, which also drops every
+        conversation's endpoint assignment: a heuristic you cannot correct
+        cheaply is a heuristic you cannot afford to be wrong.
+        """
+        if endpoint is None:
+            released = sorted(self.active())
+            self._until.clear()
+            return released
+        return [endpoint] if self._until.pop(endpoint, None) else []
+
     def active(self) -> dict[str, float]:
         now = time.time()
         return {k: v for k, v in self._until.items() if v > now}
 
-    def clear(self) -> None:
-        self._until.clear()
